@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+# Custom linux/arm/v7 build of wg-easy v15.4.0 (vertoforce fork, 2026-10-21).
+# Upstream dropped armv7 in v15.2 (PR #2369): Node 24 alpine has no armv7 image and
+# oxc (used by the Nuxt build) has no armv7-musl binding. Here the Nuxt/Nitro build
+# runs on the BUILD platform (its .output is plain JS); only the native pieces
+# (libsql, argon2, amneziawg-tools) build for the target, and the runtime is
+# node 22 alpine, which still ships armv7.
+# Build: docker buildx build --platform linux/arm/v7 -f Dockerfile.armv7 .
+ARG NODE_BUILD=docker.io/library/node:krypton-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+ARG NODE_RUN=docker.io/library/node:22.23.4-alpine@sha256:ebc216c22db53dbde85719a874978d5aec04e6e405ad26a3804c6f9abc4ca1a9
+ARG GO_IMG=docker.io/library/golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca
+
+# --- Web UI + server (platform-independent JS), built natively ---
+FROM --platform=$BUILDPLATFORM ${NODE_BUILD} AS build
+WORKDIR /app
+RUN npm install --global corepack@latest && corepack enable pnpm
+COPY src/package.json src/pnpm-lock.yaml src/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY src ./
+RUN pnpm build
+
+# --- amneziawg-go, cross-compiled with patched Go deps (armv7/amneziawg-go/go.mod) ---
+FROM --platform=$BUILDPLATFORM ${GO_IMG} AS awg-go
+ARG AWGGO_BRANCH=v3.0.20260805
+RUN apk add --no-cache git
+RUN git clone --depth 1 --branch ${AWGGO_BRANCH} https://github.com/amnezia-vpn/amneziawg-go /awg
+COPY armv7/amneziawg-go/go.mod armv7/amneziawg-go/go.sum /awg/
+WORKDIR /awg
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="-s -w" -o /out/amneziawg-go .
+
+# --- amneziawg-tools (C), built for the target ---
+FROM ${NODE_RUN} AS awg-tools
+ARG AWGTOOLS_BRANCH=v3.0.20260805
+WORKDIR /app
+RUN apk add --no-cache linux-headers build-base git bash && \
+    git clone --depth 1 --branch ${AWGTOOLS_BRANCH} https://github.com/amnezia-vpn/amneziawg-tools.git && \
+    cd amneziawg-tools/src && make && \
+    sed -i 's|\[\[ $proto == -4 \]\] && cmd sysctl -q net\.ipv4\.conf\.all\.src_valid_mark=1|[[ $proto == -4 ]] \&\& [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) != 1 ]] \&\& cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1|' ./wg-quick/linux.bash
+
+# --- native node modules for the target (versions match src/pnpm-lock.yaml) ---
+FROM ${NODE_RUN} AS native
+WORKDIR /app
+RUN apk add --no-cache python3 make g++
+RUN npm install --no-save --omit=dev libsql@0.5.29 argon2@0.45.1
+
+# --- runtime ---
+FROM ${NODE_RUN}
+WORKDIR /app
+HEALTHCHECK --interval=1m --timeout=5s --retries=3 CMD /usr/bin/timeout 5s /bin/sh -c "/usr/bin/wg show | /bin/grep -q interface || exit 1"
+COPY --from=build /app/.output /app
+COPY --from=build /app/server/database/migrations /app/server/database/migrations
+COPY --from=native /app/node_modules /app/server/node_modules
+COPY --from=build /app/cli/cli.sh /usr/local/bin/cli
+COPY --from=awg-go /out/amneziawg-go /usr/bin/amneziawg-go
+COPY --from=awg-tools /app/amneziawg-tools/src/wg /usr/bin/awg
+COPY --from=awg-tools /app/amneziawg-tools/src/wg-quick/linux.bash /usr/bin/awg-quick
+RUN chmod +x /usr/local/bin/cli /usr/bin/amneziawg-go /usr/bin/awg /usr/bin/awg-quick
+# Current Alpine packages (OpenSSL etc.); npm/corepack/yarn are not used at runtime
+# and carry most of the base image's npm-internal CVEs (tar, glob, minimatch, ...).
+RUN apk upgrade --no-cache && \
+    apk add --no-cache dpkg dumb-init iptables ip6tables nftables kmod iptables-legacy wireguard-go wireguard-tools && \
+    rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg
+RUN mkdir -p /etc/amnezia && ln -s /etc/wireguard /etc/amnezia/amneziawg
+RUN update-alternatives --install /usr/sbin/iptables iptables /usr/sbin/iptables-legacy 10 --slave /usr/sbin/iptables-restore iptables-restore /usr/sbin/iptables-legacy-restore --slave /usr/sbin/iptables-save iptables-save /usr/sbin/iptables-legacy-save
+RUN update-alternatives --install /usr/sbin/ip6tables ip6tables /usr/sbin/ip6tables-legacy 10 --slave /usr/sbin/ip6tables-restore ip6tables-restore /usr/sbin/ip6tables-legacy-restore --slave /usr/sbin/ip6tables-save ip6tables-save /usr/sbin/ip6tables-legacy-save
+ENV DEBUG=Server,WireGuard,Database,CMD,Firewall
+ENV PORT=51821
+ENV HOST=0.0.0.0
+ENV INSECURE=false
+ENV INIT_ENABLED=false
+ENV DISABLE_IPV6=false
+LABEL org.opencontainers.image.source=https://github.com/vertoforce/wg-easy
+LABEL org.opencontainers.image.version=v15.4.0-armv7-custom-1
+CMD ["/usr/bin/dumb-init", "node", "server/index.mjs"]

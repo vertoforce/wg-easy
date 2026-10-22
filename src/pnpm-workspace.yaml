@@ -13,3 +13,7 @@ publicHoistPattern:
   - 'h3'
   - 'nitropack'
   - 'ofetch'
+
+# armv7 custom build (vertoforce, 2026-10-21): security bumps over the v15.4.0 lockfile.
+overrides:
+  devalue: ^5.9.4
